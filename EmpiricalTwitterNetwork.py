@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import gc
 
-# تنظیمات ژورنال
 plt.rcParams.update({"font.family": "Times New Roman", "font.size": 10, "figure.dpi": 300})
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
