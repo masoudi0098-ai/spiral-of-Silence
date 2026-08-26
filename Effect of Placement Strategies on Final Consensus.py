@@ -3,6 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import random
 
+
+# ==========================================
+# 1. Configuration & Styling
+# ==========================================
 plt.rcParams.update({
     "font.family": "serif",
     "font.serif": ["Times New Roman"],
@@ -15,28 +19,42 @@ plt.rcParams.update({
 })
 
 
-def load_network_safe(filepath, target_nodes=6000):
-    print(f"[*] Loading network from {filepath}...")
-    G = nx.Graph()
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#') or line.startswith('%'):
-                continue
-            parts = line.split(',') if ',' in line else line.split()
-            if len(parts) >= 2:
-                G.add_edge(parts[0], parts[1])
-    G = G.to_undirected()
-    lcc = max(nx.connected_components(G), key=len)
-    G_sub = G.subgraph(lcc).copy()
-    if G_sub.number_of_nodes() > target_nodes:
-        degrees = dict(G_sub.degree())
-        top_nodes = sorted(degrees, key=degrees.get, reverse=True)[:target_nodes]
-        G_final = G_sub.subgraph(top_nodes).copy()
-    else:
-        G_final = G_sub
+# ==========================================
+# 2. Scientifically Valid Sampling (Snowball)
+# ==========================================
+def snowball_sampling(filepath, target_nodes=6000, seed=42):
+    """
+    Extracts a topology-preserving subgraph using BFS (Snowball Sampling)
+    to maintain the true scale-free properties of the empirical network.
+    """
+    print(f"[*] Loading and extracting true topology from {filepath}...")
+    G_raw = nx.read_edgelist(filepath, delimiter=',', nodetype=int, data=False)
+    lcc_nodes = max(nx.connected_components(G_raw), key=len)
+    G_sub = G_raw.subgraph(lcc_nodes).copy()
+    
+    rng = random.Random(seed)
+    start_node = list(G_sub.nodes())[seed % len(G_sub.nodes())]
+    sampled_nodes = {start_node}
+    queue = deque([start_node])
+    
+    while queue and len(sampled_nodes) < target_nodes:
+        current = queue.popleft()
+        neighbors = list(G_sub.neighbors(current))
+        rng.shuffle(neighbors)
+        
+        for neighbor in neighbors:
+            if neighbor not in sampled_nodes:
+                sampled_nodes.add(neighbor)
+                queue.append(neighbor)
+                if len(sampled_nodes) >= target_nodes:
+                    break
+                    
+    G_final = G_sub.subgraph(sampled_nodes).copy()
     return nx.convert_node_labels_to_integers(G_final)
 
+# ==========================================
+# 3. Mathematical Core
+# ==========================================
 
 def compute_omega(z, k, k_mean):
     """
@@ -119,14 +137,16 @@ def theoretical_zc(k_hub, k_mean, beta, c0, b, theta):
     zc = (k_mean * M) / (k_hub + k_mean * M)
     return zc, M
 
-
-# =================================================================
-# MAIN
-# =================================================================
-file_path = "soc-political-retweet.edges"
-try:
-
-    G = load_network_safe(file_path, target_nodes=6000)
+# ==========================================
+# 4. Main Simulation & Analysis Engine
+# ==========================================
+def main():
+    file_path = "soc-political-retweet.edges"
+    try:
+        G = snowball_sampling(file_path, target_nodes=6000)
+    except FileNotFoundError:
+        print("[!] Error: Dataset not found.")
+        return
     A = nx.to_numpy_array(G)
     N = G.number_of_nodes()
     k_mean = np.array(A.sum(axis=1)).mean()
@@ -141,57 +161,86 @@ try:
     nodes_pr = sorted(pr_cent, key=pr_cent.get, reverse=True)
     nodes_all = list(G.nodes())
 
-    # ---- Model parameters (must match Sec. 4.1 / 4.1.1 of the paper) ----
+    # ---- Model parameters ----
     ALPHA = 0.5
-    BETA = 3.0     # pick the representative value used for Fig. 4 (paper sweeps beta in {1,2,2.5,3,4.5,5})
+    BETA = 3.0    
     C0 = 1.0
-    B_PAYOFF = 0.3   # NEW parameter, not in original code -- must be justified/reported
-    THETA = 0.3      # NEW parameter, not in original code -- must be justified/reported
-    SIGMA = 15.0     # renamed from "gamma" to match paper notation
+    B_PAYOFF = 0.3   
+    THETA = 0.3
+    SIGMA = 15.0 
+    
+    # Configuration for smooth curves starting from ZERO
+    z_vals = np.linspace(0.0, 0.25, 26)
+    ENSEMBLE_SIZE = 1000
+    
+    results_deg = []
+    results_bet = []
+    results_pr = []
+    results_rand = []
 
-    z_vals = np.linspace(0.01, 0.25, 20)
-    results = {'Degree': [], 'Betweenness': [], 'PageRank': [], 'Random': []}
-
-    print("[*] Running Simulations for different Z values...")
+    print(f"[*] Running Simulations with Ensemble Size = {ENSEMBLE_SIZE}...")
     for z in z_vals:
-        num_committed = max(1, int(z * N))
-        c_deg = [G.nodes[n] if False else int(n) for n in nodes_deg[:num_committed]]  # keep as int indices
+        num_committed = int(z * N)
+        
         c_deg = nodes_deg[:num_committed]
         c_bet = nodes_bet[:num_committed]
         c_pr = nodes_pr[:num_committed]
-        c_rand = random.sample(nodes_all, num_committed)
 
-        results['Degree'].append(run_dynamics(A, c_deg, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
-        results['Betweenness'].append(run_dynamics(A, c_bet, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
-        results['PageRank'].append(run_dynamics(A, c_pr, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
-        results['Random'].append(run_dynamics(A, c_rand, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
+        # Ensemble averaging for noise reduction
+        temp_deg, temp_bet, temp_pr, temp_rand = [], [], [], []
 
-    # ---- Theoretical zc from Eq. (12), evaluated at the mean degree of the
-    #      hub set actually targeted by the Degree-Centrality strategy ----
-    # Use a representative z near the observed tipping region to pick k_hub,
-    # since the hub set size (num_committed) depends on z.
+        for e in range(ENSEMBLE_SIZE if num_committed > 0 else 1):
+            c_rand = random.sample(nodes_all, num_committed)
+            
+            temp_deg.append(run_dynamics(A, c_deg, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
+            temp_bet.append(run_dynamics(A, c_bet, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
+            temp_pr.append(run_dynamics(A, c_pr, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
+            temp_rand.append(run_dynamics(A, c_rand, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
+
+        results_deg.append(np.mean(temp_deg))
+        results_bet.append(np.mean(temp_bet))
+        results_pr.append(np.mean(temp_pr))
+        results_rand.append(np.mean(temp_rand))
+
+    # ==========================================
+    # 5. Theoretical vs Empirical Analysis (Reviewer Request)
+    # ==========================================
     z_ref = 0.03
     num_committed_ref = max(1, int(z_ref * N))
     hub_nodes_ref = nodes_deg[:num_committed_ref]
     k_hub = np.mean([A[n].sum() for n in hub_nodes_ref])
 
     zc_theory, M_val = theoretical_zc(k_hub, k_mean, BETA, C0, B_PAYOFF, THETA)
+    # Calculate Empirical Zc (Intersection with Theta=0.5 symmetry breaking)
+    empirical_zc = None
+    for z, res in zip(z_vals, results_deg):
+        if res >= 0.5:
+            empirical_zc = z
+            break
+            
     print(f"[*] Mean degree of network <k> = {k_mean:.2f}")
     print(f"[*] Mean degree of targeted hubs k_hub = {k_hub:.2f}")
     print(f"[*] M = {M_val:.4f}")
-    print(f"[*] Theoretical z_c (Eq. 12) = {zc_theory}")
+    print(f"[*] Theoretical z_c (Eq. 12) = {zc_theory:4f}")
 
+    if empirical_zc is not None and zc_theory is not None:
+        rel_error = abs(zc_theory - empirical_zc) / empirical_zc * 100
+        print(f"[*] Empirical z_c from simulation = {empirical_zc:.4f}")
+        print(f"[*] Relative Error (Theory vs Empiric) = {rel_error:.2f}%")
     # ---- Plot ----
-    plt.figure(figsize=(6, 4.5))
-    plt.plot(z_vals, results['Degree'], 'r-o', linewidth=2, markersize=5, label='Degree Centrality (Hubs)')
-    plt.plot(z_vals, results['Betweenness'], 'b-s', linewidth=1.5, markersize=4, label='Betweenness Centrality')
-    plt.plot(z_vals, results['PageRank'], 'g-^', linewidth=1.5, markersize=4, label='PageRank')
-    plt.plot(z_vals, results['Random'], 'k--', linewidth=1.5, label='Random Placement')
-    plt.axhline(y=0.8, color='gray', linestyle=':', alpha=0.7, label='Consensus Threshold')
+    plt.figure(figsize=(7, 5))
+    
+    plt.plot(z_vals, results_deg, 'r-o', linewidth=2.5, markersize=6, label='Degree Centrality (Hubs)')
+    plt.plot(z_vals, results_bet, 'b-s', linewidth=2, markersize=5, label='Betweenness Centrality')
+    plt.plot(z_vals, results_pr, 'g-^', linewidth=2, markersize=5, label='PageRank')
+    plt.plot(z_vals, results_rand, 'k--', linewidth=2.5, label='Random Placement')
+    
+    plt.axhline(y=0.8, color='gray', linestyle=':', alpha=0.8, linewidth=2, label='Consensus Threshold (0.8)')
+
 
     if zc_theory is not None:
-        plt.axvline(x=zc_theory, color='purple', linestyle='-.', linewidth=1.5,
-                    label=fr'Theoretical $z_c$ (Eq. 12) $\approx {zc_theory:.3f}$')
+        plt.axvline(x=zc_theory, color='purple', linestyle='-.', linewidth=2,
+                    label=fr'Theoretical $z_c$ (Eq. 14) $\approx {zc_theory:.3f}$')
 
     plt.title("Effect of Placement Strategies on Final Consensus", fontweight='bold')
     plt.xlabel(r"Fraction of Committed Agents ($z$)", fontweight='bold')
