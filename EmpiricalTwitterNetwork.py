@@ -84,7 +84,9 @@ def main():
     z_vals = np.linspace(0.0, 0.25, res)
     alpha_vals = np.linspace(0.1, 1.0, res)
     heatmap_data = np.zeros((res, res))
-    
+
+    ENSEMBLE_SIZE = 1000 
+
     # Theory Parameters (Eqs 4, 7, 9)
     theta_threshold = 0.15   # Psychological threshold
     sigma = 15.0             # Steepness of Heaviside sigmoid (Eq 7)
@@ -93,57 +95,61 @@ def main():
     b = 0.1                  # Base intrinsic reward (Eq 9)
     dt = 0.1                 # Replicator integration step
     
-    print("[*] Simulating Non-linear Opinion Dynamics. Please wait...")
+    print("[*] Simulating Phase Diagram with Ensemble Size = {ENSEMBLE_SIZE}...")
     
     for i, alpha in enumerate(alpha_vals):
         for j, z in enumerate(z_vals):
             num_hubs = int(z * N)
             hubs = sorted_nodes[:num_hubs]
             
-            # 0.0 = Silent, 1.0 = Expressing
-            states = torch.zeros(N, dtype=torch.float32, device=DEVICE)
-            if num_hubs > 0:
-                states[hubs] = 1.0
-                
-            for step in range(80): # Adequate steps for thermodynamic equilibrium
-                # O(E) calculation of neighborhood states
-                active_sum = torch.sparse.mm(A_sparse, states.unsqueeze(1)).squeeze(1)
-                silent_sum = torch.sparse.mm(A_sparse, (1.0 - states).unsqueeze(1)).squeeze(1)
-                
-                # Equations (5 & 6): Effective visibility topology
-                phi_1 = active_sum / (active_sum + alpha * silent_sum + 1e-12)
-                phi_0 = (alpha * active_sum) / (alpha * active_sum + silent_sum + 1e-12)
-                phi = torch.where(states == 1.0, phi_1, phi_0)
-                
-                # Equation (7): Smoothed Heaviside Step Function
-                H_gate = 1.0 / (1.0 + torch.exp(-sigma * (phi - theta_threshold)))
-                
-                # Equation (4): Dynamic cost
-                cost = c0 * torch.exp(-beta * phi)
-                
-                # Equation (9 / 11): Net Payoff with baseline factor 'b'
-                net_payoff = (1.0 - b) * phi - cost
-                
-                # Equation (8): Microscopic Replicator Dynamics Probabilities
-                prob_0_to_1 = torch.clamp(dt * torch.relu(net_payoff) * H_gate, 0.0, 1.0)
-                prob_1_to_0 = torch.clamp(dt * torch.relu(-net_payoff) * H_gate, 0.0, 1.0)
-                
-                rand_tensor = torch.rand(N, device=DEVICE)
-                new_states = states.clone()
-                
-                # Probabilistic transitions
-                new_states[(states == 0.0) & (rand_tensor < prob_0_to_1)] = 1.0
-                new_states[(states == 1.0) & (rand_tensor < prob_1_to_0)] = 0.0
-                
-                # Rigid constraint: Committed agents (Zealots) never revert
+            ensemble_outcomes = []
+            for e in range(ENSEMBLE_SIZE):
+                # 0.0 = Silent, 1.0 = Expressing
+                states = torch.zeros(N, dtype=torch.float32, device=DEVICE)
                 if num_hubs > 0:
-                    new_states[hubs] = 1.0
+                    states[hubs] = 1.0
+                    
+                for step in range(80): # Adequate steps for thermodynamic equilibrium
+                    # O(E) calculation of neighborhood states
+                    active_sum = torch.sparse.mm(A_sparse, states.unsqueeze(1)).squeeze(1)
+                    silent_sum = torch.sparse.mm(A_sparse, (1.0 - states).unsqueeze(1)).squeeze(1)
+                    
+                    # Equations (5 & 6): Effective visibility topology
+                    phi_1 = active_sum / (active_sum + alpha * silent_sum + 1e-12)
+                    phi_0 = (alpha * active_sum) / (alpha * active_sum + silent_sum + 1e-12)
+                    phi = torch.where(states == 1.0, phi_1, phi_0)
+                    
+                    # Equation (7): Smoothed Heaviside Step Function
+                    H_gate = 1.0 / (1.0 + torch.exp(-sigma * (phi - theta_threshold)))
+                    
+                    # Equation (4): Dynamic cost
+                    cost = c0 * torch.exp(-beta * phi)
+                    
+                    # Equation (9 / 11): Net Payoff with baseline factor 'b'
+                    net_payoff = (1.0 - b) * phi - cost
+                    
+                    # Equation (8): Microscopic Replicator Dynamics Probabilities
+                    prob_0_to_1 = torch.clamp(dt * torch.relu(net_payoff) * H_gate, 0.0, 1.0)
+                    prob_1_to_0 = torch.clamp(dt * torch.relu(-net_payoff) * H_gate, 0.0, 1.0)
+                    
+                    rand_tensor = torch.rand(N, device=DEVICE)
+                    new_states = states.clone()
+                    
+                    # Probabilistic transitions
+                    new_states[(states == 0.0) & (rand_tensor < prob_0_to_1)] = 1.0
+                    new_states[(states == 1.0) & (rand_tensor < prob_1_to_0)] = 0.0
+                    
+                    # Rigid constraint: Committed agents (Zealots) never revert
+                    if num_hubs > 0:
+                        new_states[hubs] = 1.0
+                    
+                    if torch.equal(states, new_states):
+                        break
+                    states = new_states
                 
-                if torch.equal(states, new_states):
-                    break
-                states = new_states
-                
-            heatmap_data[i, j] = states.mean().item()
+                ensemble_outcomes.append(states.mean().item())
+            
+            heatmap_data[i, j] = np.mean(ensemble_outcomes)
             
         torch.cuda.empty_cache()
         gc.collect()
@@ -151,9 +157,8 @@ def main():
     # ==========================================
     # 4. HD Plotting & Critical Contours
     # ==========================================
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(9, 6))
     
-    # Custom Color Map: Deep Blue -> Green -> Yellow
     colors = ["#000033", "#1f77b4", "#2ca02c", "#6cff56", "#ffff00"]
     custom_cmap = LinearSegmentedColormap.from_list("DarkBlueToYellow", colors, N=256)
     
@@ -162,11 +167,9 @@ def main():
                    origin='lower', aspect='auto', cmap=custom_cmap, interpolation='bilinear',
                    vmin=0.0, vmax=1.0) 
     
-    # Thermodynamic critical levels (Equation roots mapping)
     critical_levels = [0.2, 0.5, 0.8]
     contours = ax.contour(z_vals, alpha_vals, heatmap_data, levels=critical_levels, 
                           colors='red', linewidths=1.5, linestyles='dashed')
-    
     
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label(r'Steady-State Expressive Fraction ($\Theta^*$)', fontsize=13, labelpad=12)
