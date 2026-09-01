@@ -102,54 +102,50 @@ def main():
             num_hubs = int(z * N)
             hubs = sorted_nodes[:num_hubs]
             
-            ensemble_outcomes = []
-            for e in range(ENSEMBLE_SIZE):
-                # 0.0 = Silent, 1.0 = Expressing
-                states = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+            states = torch.zeros((N, ENSEMBLE_SIZE), dtype=torch.float32, device=DEVICE)
+
+            if num_hubs > 0:
+                states[hubs] = 1.0
+                    
+            for step in range(80): 
+                active_sum = torch.sparse.mm(A_sparse, states)
+                silent_sum = torch.sparse.mm(A_sparse, 1.0 - states)
+                    
+                # Equations (5 & 6): Effective visibility topology
+                phi_1 = active_sum / (active_sum + alpha * silent_sum + 1e-12)
+                phi_0 = (alpha * active_sum) / (alpha * active_sum + silent_sum + 1e-12)
+                phi = torch.where(states == 1.0, phi_1, phi_0)
+                    
+                # Equation (7): Smoothed Heaviside Step Function
+                H_gate = 1.0 / (1.0 + torch.exp(-sigma * (phi - theta_threshold)))
+                    
+                # Equation (4): Dynamic cost
+                cost = c0 * torch.exp(-beta * phi)
+                    
+                # Equation (9 / 11): Net Payoff with baseline factor 'b'
+                net_payoff = (1.0 - b) * phi - cost
+                    
+                # Equation (8): Microscopic Replicator Dynamics Probabilities
+                prob_0_to_1 = torch.clamp(dt * torch.relu(net_payoff) * H_gate, 0.0, 1.0)
+                prob_1_to_0 = torch.clamp(dt * torch.relu(-net_payoff) * H_gate, 0.0, 1.0)
+                    
+                rand_tensor = torch.rand(N, device=DEVICE)
+                new_states = states.clone()
+                   
+                # Probabilistic transitions
+                new_states[(states == 0.0) & (rand_tensor < prob_0_to_1)] = 1.0
+                new_states[(states == 1.0) & (rand_tensor < prob_1_to_0)] = 0.0
+                    
+                # Rigid constraint: Committed agents (Zealots) never revert
                 if num_hubs > 0:
-                    states[hubs] = 1.0
+                    new_states[hubs] = 1.0
                     
-                for step in range(80): # Adequate steps for thermodynamic equilibrium
-                    # O(E) calculation of neighborhood states
-                    active_sum = torch.sparse.mm(A_sparse, states.unsqueeze(1)).squeeze(1)
-                    silent_sum = torch.sparse.mm(A_sparse, (1.0 - states).unsqueeze(1)).squeeze(1)
-                    
-                    # Equations (5 & 6): Effective visibility topology
-                    phi_1 = active_sum / (active_sum + alpha * silent_sum + 1e-12)
-                    phi_0 = (alpha * active_sum) / (alpha * active_sum + silent_sum + 1e-12)
-                    phi = torch.where(states == 1.0, phi_1, phi_0)
-                    
-                    # Equation (7): Smoothed Heaviside Step Function
-                    H_gate = 1.0 / (1.0 + torch.exp(-sigma * (phi - theta_threshold)))
-                    
-                    # Equation (4): Dynamic cost
-                    cost = c0 * torch.exp(-beta * phi)
-                    
-                    # Equation (9 / 11): Net Payoff with baseline factor 'b'
-                    net_payoff = (1.0 - b) * phi - cost
-                    
-                    # Equation (8): Microscopic Replicator Dynamics Probabilities
-                    prob_0_to_1 = torch.clamp(dt * torch.relu(net_payoff) * H_gate, 0.0, 1.0)
-                    prob_1_to_0 = torch.clamp(dt * torch.relu(-net_payoff) * H_gate, 0.0, 1.0)
-                    
-                    rand_tensor = torch.rand(N, device=DEVICE)
-                    new_states = states.clone()
-                    
-                    # Probabilistic transitions
-                    new_states[(states == 0.0) & (rand_tensor < prob_0_to_1)] = 1.0
-                    new_states[(states == 1.0) & (rand_tensor < prob_1_to_0)] = 0.0
-                    
-                    # Rigid constraint: Committed agents (Zealots) never revert
-                    if num_hubs > 0:
-                        new_states[hubs] = 1.0
-                    
-                    if torch.equal(states, new_states):
-                        break
-                    states = new_states
+                if torch.equal(states, new_states):
+                    break
+                states = new_states
                 
-                ensemble_outcomes.append(states.mean().item())
             
-            heatmap_data[i, j] = np.mean(ensemble_outcomes)
+            heatmap_data[i, j] = states.mean().item()
             
         torch.cuda.empty_cache()
         gc.collect()
