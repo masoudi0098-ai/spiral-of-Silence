@@ -1,8 +1,15 @@
 import networkx as nx
 import numpy as np
+import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 import random
+from collections import deque
+import warnings
+import time
 
+# Suppress runtime warnings for safe division
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ==========================================
 # 1. Configuration & Styling
@@ -11,24 +18,36 @@ plt.rcParams.update({
     "font.family": "serif",
     "font.serif": ["Times New Roman"],
     "mathtext.fontset": "stix",
-    "font.size": 9,
-    "axes.titlesize": 9,
-    "axes.labelsize": 9,
-    "legend.fontsize": 8,
-    "figure.dpi": 300,
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "legend.fontsize": 9,
+    "figure.dpi": 400,
 })
 
+MASTER_SEED = 42
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"[*] Simulation Engine running on: {DEVICE}")
+
+# Set deterministic behavior
+random.seed(MASTER_SEED)
+np.random.seed(MASTER_SEED)
+torch.manual_seed(MASTER_SEED)
 
 # ==========================================
 # 2. Scientifically Valid Sampling (Snowball)
 # ==========================================
 def snowball_sampling(filepath, target_nodes=6000, seed=42):
     """
-    Extracts a topology-preserving subgraph using BFS (Snowball Sampling)
-    to maintain the true scale-free properties of the empirical network.
+    Unified Graph Extraction Pipeline:
+    1. Loads dataset
+    2. Enforces Undirected Graph topology
+    3. Extracts Largest Connected Component (LCC)
+    4. Applies Snowball (BFS) sampling to reach target_nodes
     """
     print(f"[*] Loading and extracting true topology from {filepath}...")
-    G_raw = nx.read_edgelist(filepath, delimiter=',', nodetype=int, data=False)
+    
+    G_raw = nx.read_edgelist(filepath, delimiter=',', nodetype=int, data=False, create_using=nx.Graph())
     lcc_nodes = max(nx.connected_components(G_raw), key=len)
     G_sub = G_raw.subgraph(lcc_nodes).copy()
     
@@ -49,111 +68,75 @@ def snowball_sampling(filepath, target_nodes=6000, seed=42):
                 if len(sampled_nodes) >= target_nodes:
                     break
                     
-    G_final = G_sub.subgraph(sampled_nodes).copy()
-    return nx.convert_node_labels_to_integers(G_final)
+    return nx.convert_node_labels_to_integers(G_sub.subgraph(sampled_nodes).copy())
 
 # ==========================================
-# 3. Mathematical Core
+# 3. GPU-Accelerated Replicator Dynamics
 # ==========================================
+def run_dynamics_gpu(A_sparse, is_committed, omega_tensor, N, ENSEMBLE_SIZE, 
+                     alpha=0.5, beta=3.0, c0=1.0, b=0.3, theta=0.3, sigma=15.0, max_steps=5000):
+    
+    states = torch.zeros((N, ENSEMBLE_SIZE), dtype=torch.float32, device=DEVICE)
+    states = torch.where(is_committed, 1.0, states)
 
-def compute_omega(z, k, k_mean):
-    """
-    Eq. (1): encounter frequency of a committed agent in the
-    neighborhood of a node of degree k.
-        Omega_k(z) = z*k / (<k>*(1-z))
-    k may be a scalar or a numpy array (per-node degree).
-    """
-    z = min(max(z, 0.0), 0.999)  # keep away from the z=1 singularity
-    return (z * k) / (k_mean * (1 - z) + 1e-12)
+    # Circular Buffer for m(t) - Table III Stopping Criterion
+    m_history = torch.zeros((500, ENSEMBLE_SIZE), dtype=torch.float32, device=DEVICE)
 
+    for t in range(max_steps):
+        active_sum = torch.sparse.mm(A_sparse, states)
+        silent_sum = torch.sparse.mm(A_sparse, 1.0 - states)
 
-def run_dynamics(A, committed_nodes, z, alpha=0.5, beta=3.0, c0=1.0,
-                  b=0.3, theta=0.3, sigma=15.0, max_steps=50, seed=None):
-    """
-    Agent-based implementation of Eqs. (4), (5), (6), (8):
+        phi_1 = (active_sum + omega_tensor) / (active_sum + alpha * silent_sum + omega_tensor + 1e-12)
+        phi_0 = (alpha * active_sum + omega_tensor) / (alpha * active_sum + silent_sum + omega_tensor + 1e-12)
+        phi = torch.where(states == 1.0, phi_1, phi_0)
 
-      - A_eff[i,j] = A[i,j] * V[i,j]     (Eq. 5: V=1 if same strategy,
-                                           V=alpha if opinion-discordant)
-      - phi_i = (sum_j A_eff[i,j]*x_j + Omega_i*x_committed_proxy)
-                / (sum_j A_eff[i,j] + Omega_i)         (Eq. 4)
-      - F(phi) = (1-b)*phi - c0*exp(-beta*phi)          (pure payoff, Eq. 9)
-      - H(phi-theta) = sigmoid(sigma*(phi-theta))       (Eq. 6, cognitive gate)
-      - expression probability = sigmoid(sigma*F) * H   (Eq. 8, discretized)
+        F = (1 - b) * phi - c0 * torch.exp(-beta * phi)
+        H = 1.0 / (1.0 + torch.exp(-sigma * (phi - theta)))
+        prob_express = (1.0 / (1.0 + torch.exp(-sigma * F))) * H
 
-    theta and b are NOT present in the original repository code and
-    must be chosen/justified by the authors (see note below).
-    """
-    rng = np.random.default_rng(seed)
-    N = A.shape[0]
-    deg = A.sum(axis=1)
-    deg[deg == 0] = 1
-    k_mean = deg.mean()
-
-    states = np.zeros(N)
-    states[committed_nodes] = 1.0
-    is_committed = np.zeros(N, dtype=bool)
-    is_committed[committed_nodes] = True
-
-    omega = compute_omega(z, deg, k_mean)  # Eq. (1), per-node using own degree
-
-    for _ in range(max_steps):
-        prev_states = states.copy()
-
-        # Eq. (5): effective adjacency via the visibility matrix
-        same_strategy = (states[:, None] == states[None, :]).astype(float)
-        V = np.where(same_strategy == 1.0, 1.0, alpha)
-        A_eff = A * V
-
-        # Eq. (4): local perceptual field, including committed-agent exposure
-        numerator = A_eff @ states + omega * 1.0     # committed encounters are always expressive (x=1)
-        denominator = A_eff.sum(axis=1) + omega
-        denominator[denominator == 0] = 1e-8
-        phi = numerator / denominator
-
-        F = (1 - b) * phi - c0 * np.exp(-beta * phi)          # Eq. (9)
-        H = 1.0 / (1.0 + np.exp(-sigma * (phi - theta)))       # Eq. (6)
-        prob_express = (1.0 / (1.0 + np.exp(-sigma * F))) * H  # discretized Eq. (8)
-
-        rand_draw = rng.random(N)
-        new_states = np.where(prob_express > rand_draw, 1.0, 0.0)
-        new_states[is_committed] = 1.0
+        rand_draw = torch.rand((N, ENSEMBLE_SIZE), device=DEVICE)
+        new_states = torch.where(prob_express > rand_draw, 1.0, 0.0)
+        
+        new_states = torch.where(is_committed, 1.0, new_states)
         states = new_states
 
-        if np.array_equal(states, prev_states):
-            break
+        # Calculate Macroscopic State m(t)
+        m_t = states.mean(dim=0)
+        
+        # Check |m(t) - m(t-500)| < 10^-5
+        if t >= 500:
+            m_past = m_history[t % 500]
+            if torch.all(torch.abs(m_t - m_past) < 1e-5):
+                break
+                
+        # Update Circular Buffer
+        m_history[t % 500] = m_t
 
-    return np.mean(states)
-
+    return states.mean(dim=0).cpu().numpy()
 
 def theoretical_zc(k_hub, k_mean, beta, c0, b, theta):
-    """
-    Eq. (12):
-        M  = c0*exp(-beta*theta) - (1-b)*theta
-        zc = (<k>*M) / (k_hub + <k>*M)
-    """
     M = c0 * np.exp(-beta * theta) - (1 - b) * theta
     if M <= 0:
-        return None, M  # Eq. (12) requires M > 0 for a meaningful zc in (0,1)
+        return None, M  
     zc = (k_mean * M) / (k_hub + k_mean * M)
     return zc, M
 
 # ==========================================
-# 4. Main Simulation & Analysis Engine
+# 4. Main GPU Workflow
 # ==========================================
 def main():
     file_path = "soc-political-retweet.edges"
     try:
-        G = snowball_sampling(file_path, target_nodes=6000)
+        G = snowball_sampling(file_path, target_nodes=6000, seed=MASTER_SEED)
     except FileNotFoundError:
-        print("[!] Error: Dataset not found.")
+        print("[!] Error: Dataset not found. Please ensure 'soc-political-retweet.edges' is in the working directory.")
         return
-    A = nx.to_numpy_array(G)
-    N = G.number_of_nodes()
-    k_mean = np.array(A.sum(axis=1)).mean()
 
+    N = G.number_of_nodes()
+    
     print("[*] Computing Network Centralities... (Please wait)")
     deg_cent = nx.degree_centrality(G)
-    bet_cent = nx.betweenness_centrality(G, k=min(100, N))
+    bet_cent = nx.betweenness_centrality(G, k=min(100, N), seed=MASTER_SEED)
     pr_cent = nx.pagerank(G)
 
     nodes_deg = sorted(deg_cent, key=deg_cent.get, reverse=True)
@@ -161,98 +144,147 @@ def main():
     nodes_pr = sorted(pr_cent, key=pr_cent.get, reverse=True)
     nodes_all = list(G.nodes())
 
-    # ---- Model parameters ----
-    ALPHA = 0.5
-    BETA = 3.0    
-    C0 = 1.0
-    B_PAYOFF = 0.3   
-    THETA = 0.3
-    SIGMA = 15.0 
+    A_scipy = nx.to_scipy_sparse_array(G, format='coo')
+    i = torch.LongTensor(np.vstack((A_scipy.row, A_scipy.col)))
+    v = torch.FloatTensor(A_scipy.data)
+    A_sparse = torch.sparse_coo_tensor(i, v, torch.Size(A_scipy.shape)).to(DEVICE)
     
-    # Configuration for smooth curves starting from ZERO
-    z_vals = np.linspace(0.0, 0.25, 26)
-    ENSEMBLE_SIZE = 1000
-    
-    results_deg = []
-    results_bet = []
-    results_pr = []
-    results_rand = []
+    deg_tensor = torch.sparse.sum(A_sparse, dim=1).to_dense().unsqueeze(1)
+    deg_tensor[deg_tensor == 0] = 1.0
+    k_mean = deg_tensor.mean().item()
 
-    print(f"[*] Running Simulations with Ensemble Size = {ENSEMBLE_SIZE}...")
+    # Model Parameters
+    ALPHA = 0.5; BETA = 3.0; C0 = 1.0; B_PAYOFF = 0.3; THETA = 0.3; SIGMA = 15.0     
+    z_vals = np.linspace(0.0, 0.25, 26) 
+    ENSEMBLE_SIZE = 1000 
+
+    master_rng = np.random.default_rng(MASTER_SEED)
+    realization_seeds = master_rng.integers(0, 9999999, size=ENSEMBLE_SIZE)
+
+    raw_results = []
+    print(f"\n[*] Launching Massively Parallel GPU Simulations (Ensemble = {ENSEMBLE_SIZE})...")
+    start_time = time.time()
+
     for z in z_vals:
+        print(f"    -> Processing z = {z:.2f}")
         num_committed = int(z * N)
+        omega = (z * deg_tensor) / (k_mean * (1 - z) + 1e-12)
         
-        c_deg = nodes_deg[:num_committed]
-        c_bet = nodes_bet[:num_committed]
-        c_pr = nodes_pr[:num_committed]
+        is_committed_deg = torch.zeros((N, ENSEMBLE_SIZE), dtype=torch.bool, device=DEVICE)
+        is_committed_bet = torch.zeros((N, ENSEMBLE_SIZE), dtype=torch.bool, device=DEVICE)
+        is_committed_pr = torch.zeros((N, ENSEMBLE_SIZE), dtype=torch.bool, device=DEVICE)
+        is_committed_rand = torch.zeros((N, ENSEMBLE_SIZE), dtype=torch.bool, device=DEVICE)
 
-        # Ensemble averaging for noise reduction
-        temp_deg, temp_bet, temp_pr, temp_rand = [], [], [], []
-
-        for e in range(ENSEMBLE_SIZE if num_committed > 0 else 1):
-            c_rand = random.sample(nodes_all, num_committed)
+        if num_committed > 0:
+            is_committed_deg[nodes_deg[:num_committed], :] = True
+            is_committed_bet[nodes_bet[:num_committed], :] = True
+            is_committed_pr[nodes_pr[:num_committed], :] = True
             
-            temp_deg.append(run_dynamics(A, c_deg, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
-            temp_bet.append(run_dynamics(A, c_bet, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
-            temp_pr.append(run_dynamics(A, c_pr, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
-            temp_rand.append(run_dynamics(A, c_rand, z, ALPHA, BETA, C0, B_PAYOFF, THETA, SIGMA))
+            for e in range(ENSEMBLE_SIZE):
+                rng_cpu = np.random.default_rng(realization_seeds[e])
+                c_rand = rng_cpu.choice(nodes_all, num_committed, replace=False)
+                is_committed_rand[c_rand, e] = True
 
-        results_deg.append(np.mean(temp_deg))
-        results_bet.append(np.mean(temp_bet))
-        results_pr.append(np.mean(temp_pr))
-        results_rand.append(np.mean(temp_rand))
+        theta_deg = run_dynamics_gpu(A_sparse, is_committed_deg, omega, N, ENSEMBLE_SIZE, alpha=ALPHA)
+        theta_bet = run_dynamics_gpu(A_sparse, is_committed_bet, omega, N, ENSEMBLE_SIZE, alpha=ALPHA)
+        theta_pr = run_dynamics_gpu(A_sparse, is_committed_pr, omega, N, ENSEMBLE_SIZE, alpha=ALPHA)
+        theta_rand = run_dynamics_gpu(A_sparse, is_committed_rand, omega, N, ENSEMBLE_SIZE, alpha=ALPHA)
+
+        for e in range(ENSEMBLE_SIZE):
+            seed_val = int(realization_seeds[e])
+            raw_results.append({'strategy': 'Degree', 'z': z, 'alpha': ALPHA, 'seed': seed_val, 'final_theta': theta_deg[e]})
+            raw_results.append({'strategy': 'Betweenness', 'z': z, 'alpha': ALPHA, 'seed': seed_val, 'final_theta': theta_bet[e]})
+            raw_results.append({'strategy': 'PageRank', 'z': z, 'alpha': ALPHA, 'seed': seed_val, 'final_theta': theta_pr[e]})
+            raw_results.append({'strategy': 'Random', 'z': z, 'alpha': ALPHA, 'seed': seed_val, 'final_theta': theta_rand[e]})
+
+    end_time = time.time()
+    print(f"\n[+] Total GPU Simulation Time: {end_time - start_time:.2f} seconds.")
 
     # ==========================================
-    # 5. Theoretical vs Empirical Analysis (Reviewer Request)
+    # 5. Data Aggregation & CSV Export
+    # ==========================================
+    df_raw = pd.DataFrame(raw_results)
+    stats_df = df_raw.groupby(['z', 'strategy'])['final_theta'].agg(
+        mean_theta='mean', std_theta='std', count='count').reset_index()
+    stats_df['CI95'] = 1.96 * (stats_df['std_theta'] / np.sqrt(stats_df['count']))
+    stats_df['CI95'] = stats_df['CI95'].fillna(0)
+
+    df_final = pd.merge(df_raw, stats_df[['z', 'strategy', 'mean_theta', 'std_theta', 'CI95']], 
+                        on=['z', 'strategy'], how='left')
+    df_final = df_final[['strategy', 'z', 'alpha', 'seed', 'final_theta', 'mean_theta', 'std_theta', 'CI95']]
+    
+    df_final.to_csv('raw_results.csv', index=False)
+
+    # ==========================================
+    # 6. Reviewer Analysis Report (Console Print)
     # ==========================================
     z_ref = 0.03
-    num_committed_ref = max(1, int(z_ref * N))
-    hub_nodes_ref = nodes_deg[:num_committed_ref]
-    k_hub = np.mean([A[n].sum() for n in hub_nodes_ref])
-
+    hub_nodes_ref = nodes_deg[:max(1, int(z_ref * N))]
+    k_hub = np.mean([G.degree(n) for n in hub_nodes_ref])
     zc_theory, M_val = theoretical_zc(k_hub, k_mean, BETA, C0, B_PAYOFF, THETA)
-    # Calculate Empirical Zc (Intersection with Theta=0.5 symmetry breaking)
-    empirical_zc = None
-    for z, res in zip(z_vals, results_deg):
-        if res >= 0.5:
-            empirical_zc = z
-            break
-            
-    print(f"[*] Mean degree of network <k> = {k_mean:.2f}")
-    print(f"[*] Mean degree of targeted hubs k_hub = {k_hub:.2f}")
-    print(f"[*] M = {M_val:.4f}")
-    print(f"[*] Theoretical z_c (Eq. 12) = {zc_theory:4f}")
 
+    empirical_zc = None
+    deg_stats = stats_df[stats_df['strategy'] == 'Degree']
+    for z_val, mean_theta in zip(deg_stats['z'], deg_stats['mean_theta']):
+        if mean_theta >= 0.5:  # Symmetry breaking threshold
+            empirical_zc = z_val
+            break
+
+    print("\n" + "="*50)
+    print(" 📊 REVIEWER ANALYSIS REPORT (Copy to Paper) ")
+    print("="*50)
+    print(f"[*] Mean degree of network <k> = {k_mean:.2f}")
+    print(f"[*] Mean degree of targeted hubs (k_hub) = {k_hub:.2f}")
+    print(f"[*] M = {M_val:.4f}")
+    print(f"[*] Theoretical z_c (Eq. 13) = {zc_theory:.4f}")
+    
     if empirical_zc is not None and zc_theory is not None:
         rel_error = abs(zc_theory - empirical_zc) / empirical_zc * 100
         print(f"[*] Empirical z_c from simulation = {empirical_zc:.4f}")
         print(f"[*] Relative Error (Theory vs Empiric) = {rel_error:.2f}%")
-    # ---- Plot ----
+    print("="*50 + "\n")
+
+    # ==========================================
+    # 7. High-Quality Plotting
+    # ==========================================
+    plot_data = {
+        'Degree': {'color': 'red', 'marker': 'o', 'linestyle': '-', 'label': 'Degree Centrality (Hubs)'},
+        'Betweenness': {'color': 'blue', 'marker': 's', 'linestyle': '-', 'label': 'Betweenness Centrality'},
+        'PageRank': {'color': 'green', 'marker': '^', 'linestyle': '-', 'label': 'PageRank'},
+        'Random': {'color': 'black', 'marker': '', 'linestyle': '--', 'label': 'Random Placement'}
+    }
+
     plt.figure(figsize=(7, 5))
-    
-    plt.plot(z_vals, results_deg, 'r-o', linewidth=2.5, markersize=6, label='Degree Centrality (Hubs)')
-    plt.plot(z_vals, results_bet, 'b-s', linewidth=2, markersize=5, label='Betweenness Centrality')
-    plt.plot(z_vals, results_pr, 'g-^', linewidth=2, markersize=5, label='PageRank')
-    plt.plot(z_vals, results_rand, 'k--', linewidth=2.5, label='Random Placement')
-    
+    for strat, style in plot_data.items():
+        strat_data = stats_df[stats_df['strategy'] == strat]
+        z_arr = strat_data['z'].values
+        mean_arr = strat_data['mean_theta'].values
+        ci_arr = strat_data['CI95'].values
+        
+        plt.plot(z_arr, mean_arr, color=style['color'], marker=style['marker'], 
+                 linestyle=style['linestyle'], linewidth=2.5, markersize=5, label=style['label'])
+        plt.fill_between(z_arr, mean_arr - ci_arr, mean_arr + ci_arr, 
+                         color=style['color'], alpha=0.15, edgecolor='none')
+
     plt.axhline(y=0.8, color='gray', linestyle=':', alpha=0.8, linewidth=2, label='Consensus Threshold (0.8)')
 
-
     if zc_theory is not None:
-        plt.axvline(x=zc_theory, color='purple', linestyle='-.', linewidth=2,
-                    label=fr'Theoretical $z_c$ (Eq. 14) $\approx {zc_theory:.3f}$')
+        plt.axvline(x=zc_theory, color='purple', linestyle='-.', linewidth=2.5,
+                    label=fr'Theoretical $z_c$ $\approx {zc_theory:.3f}$')
 
-    plt.title("Effect of Placement Strategies on Final Consensus", fontweight='bold')
-    plt.xlabel(r"Fraction of Committed Agents ($z$)", fontweight='bold')
-    plt.ylabel(r"Final Expressive Fraction ($\Theta_\infty$)", fontweight='bold')
+    plt.title("Effect of Placement Strategies on Final Consensus", fontweight='bold', pad=15)
+    plt.xlabel(r"Fraction of Committed Agents ($z$)", fontweight='bold', fontsize=11)
+    plt.ylabel(r"Final Expressive Fraction ($\Theta_\infty$)", fontweight='bold', fontsize=11)
+    
     plt.xlim(0, 0.25)
-    plt.ylim(0, 1.05)
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend(loc='best', framealpha=0.9, edgecolor='black', fancybox=False)
+    plt.ylim(-0.02, 1.05)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend(loc='best', framealpha=0.95, edgecolor='black', fancybox=False, fontsize=9.5)
     plt.tight_layout()
-    plt.savefig('Fig_Placement_Strategies_with_zc.png')
-    print("[+] Success! Figure saved as 'Fig_Placement_Strategies_with_zc.png'")
-    plt.show()
+    
+    plt.savefig('Fig_Placement.png', dpi=400, bbox_inches='tight')
+    plt.savefig('Fig_Placement.pdf', format='pdf', bbox_inches='tight')
+    print("[+] Success! Figure saved and raw data exported.")
 
-except Exception as e:
-    print(f"[!] Error: {e}\nfile is not in path.")
+if __name__ == "__main__":
+    main()
