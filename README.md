@@ -53,11 +53,11 @@ Ensure the dataset file `soc-political-retweet.edges` is located in the root dir
 
 ### Reproducing Figure 3 (Empirical Phase Diagram)
 EmpiricalTwitterNetwork.py: This script utilizes an ultra-fast JIT-compiled physics kernel to compute the macroscopic steady-state expressive fraction θ across a grid of z and α.
-Output Files Generated:Fig-003.png / Fig-003.pdf: High-resolution phase diagram heatmaps featuring 0.2, 0.5, and 0.8 contour markers.
+Output Files Generated:Fig_Diagram.png / Fig_Diagram.pdf: High-resolution phase diagram heatmaps featuring 0.2, 0.5, and 0.8 contour markers.
 ### Reproducing Figure 4 (Placement Strategy Comparison)
 This script evaluates the impact of distinct targeting strategies (Degree, Betweenness, PageRank, Random) on achieving network-wide consensus.
 
 Output Files Generated:
 raw_results.csv: A comprehensive dataset containing mean expressive fractions, standard deviations, and 95% Confidence Intervals (CI) for all z values and strategies.  
-Fig_Placement_with_CI.png / Fig_Placement_with_CI.pdf: A high-quality line plot detailing the behavioral thresholds and theoretical Zc predictions with shaded error margins.   
+Fig_Placement.png / Fig_Placement.pdf: A high-quality line plot detailing the behavioral thresholds and theoretical Zc predictions with shaded error margins.   
 Console Output: A specialized reviewer analysis report computing the theoretical Zc (Eq. 13) and empirical relative errors directly in the terminal. 
